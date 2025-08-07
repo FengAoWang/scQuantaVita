@@ -9,13 +9,7 @@ dataset_params = {
     #     file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/SCLC_immune_processed.h5ad"
     # ),
     #
-    # 'pbmc12k': dict(
-    #     # dataset
-    #     dataset_name="pbmc12k",
-    #     batch_key="batch",
-    #     labels_key="str_labels",
-    #     file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/pbmc_12k_processed.h5ad"
-    # ),
+
     #
     # 'E10.5_E1S1': dict(
     #     # dataset
@@ -98,14 +92,21 @@ dataset_params = {
     # ),
 
 
-    'BMMC': dict(
-        # dataset
-        dataset_name="BMMC",
-        batch_key="batch",
-        labels_key="cell_type",
-        file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/BMMC_processed.h5ad"
-    ),
-
+    # 'BMMC': dict(
+    #     # dataset
+    #     dataset_name="BMMC",
+    #     batch_key="batch",
+    #     labels_key="cell_type",
+    #     file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/BMMC_processed.h5ad"
+    # ),
+    #
+    # 'pbmc12k': dict(
+    #     # dataset
+    #     dataset_name="pbmc12k",
+    #     batch_key="batch",
+    #     labels_key="str_labels",
+    #     file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/pbmc_12k_processed.h5ad"
+    # ),
     'pancreas': dict(
         # dataset
         dataset_name="pancreas",
@@ -113,41 +114,57 @@ dataset_params = {
         labels_key="celltype",
         file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/pancreas_processed.h5ad"
     ),
+    # #
+    # 'fetal_lung': dict(
+    #     # dataset
+    #     dataset_name="fetal_lung",
+    #     batch_key="batch",
+    #     labels_key="broad_celltype",
+    #     file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/fetal_lung_processed.h5ad"
+    # ),
+    # 'immune': dict(
+    #     dataset_name="immune",
+    #     batch_key="batch",
+    #     labels_key="final_annotation",
+    #     file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/immune_processed.h5ad"
+    # ),
+    # 'HTMCB': dict(
+    #     dataset_name="HTMCB",
+    #     batch_key="sample_id",
+    #     labels_key="cell_type",
+    #     file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/HTMCB_processed.h5ad",
+    # ),
+    #
+    # 'HLCA_core': dict(
+    #     dataset_name="HLCA_core",
+    #     batch_key="donor_id",
+    #     labels_key="cell_type",
+    #     file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/HLCA_core_processed.h5ad",
+    # ),
 
-    'fetal_lung': dict(
-        # dataset
-        dataset_name="fetal_lung",
-        batch_key="batch",
-        labels_key="broad_celltype",
-        file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/fetal_lung_processed.h5ad"
-    ),
-    'immune': dict(
-        dataset_name="immune",
-        batch_key="batch",
-        labels_key="final_annotation",
-        file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/immune_processed.h5ad"
-    ),
+    # 'BMMC_multiome': dict(
+    #     dataset_name="BMMC_multiome",
+    #     batch_key="batch",
+    #     labels_key="cell_type",
+    #     file_path="/data2/wfa/project/single_cell_multimodal/data/filter_data/BMMC/RNA_filter.h5ad"
+    # ),
 
-    'BMMC_multiome': dict(
-        dataset_name="BMMC_multiome",
-        batch_key="batch",
-        labels_key="cell_type",
-        file_path="/data2/wfa/project/single_cell_multimodal/data/filter_data/BMMC/RNA_filter.h5ad"
-    ),
 
-    'HLCA_core': dict(
-        dataset_name="HLCA_core",
-        batch_key="donor_id",
-        labels_key="cell_type",
-        file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/HLCA_core_processed.h5ad",
-    ),
 
-    'Lung_atlas': dict(
-        dataset_name="Lung_atlas",
-        batch_key="batch",
-        labels_key="cell_type",
-        file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/Lung_atlas_processed.h5ad",
-    ),
+    # 'Lung_atlas': dict(
+    #     dataset_name="Lung_atlas",
+    #     batch_key="batch",
+    #     labels_key="cell_type",
+    #     file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/Lung_atlas_processed.h5ad",
+    # ),
+
+    # 'HEOCA': dict(
+    #     dataset_name="HEOCA",
+    #     batch_key="batch",
+    #     labels_key="cell_type",
+    #     file_path="/data2/wfa/scMulti-omics/QVAE/scRNA/HEOCA_processed.h5ad",
+    # ),
+    #
 
     # 'PurifiedPBMC': dict(
     #     dataset_name="PurifiedPBMC",
@@ -216,7 +233,7 @@ VAE_training_params = {
         latent_dim=128,
         lr=1e-3,
         batch_size=128,
-        beta__kl=0.01,
+        beta_kl=0.01,
         epochs=150,
         normaliztion='batchnorm'
     ),
@@ -225,10 +242,10 @@ VAE_training_params = {
 training_params = {
     'batch_size256': dict(
         latent_dim=256,
-        lr=1e-3,
+        lr=1e-2,
         batch_size=256,
-        beta__kl=0.01,
-        epochs=500,
+        beta_kl=0.0001,
+        epochs=100,
         normaliztion='layernorm'
     ),
 

@@ -132,12 +132,14 @@ def compute_clusters_performance(adata,
 def compute_batchEffect(adata,
                         batch_key='batch',
                         label_key='cell_type',
-                        x_emb='reps'):
+                        x_emb=None):
+    if x_emb is None:
+        x_emb = ['reps']
     bm = Benchmarker(
         adata,
         batch_key=batch_key,
         label_key=label_key,
-        embedding_obsm_keys=[x_emb],
+        embedding_obsm_keys=x_emb,
         batch_correction_metrics=BatchCorrection(),
         bio_conservation_metrics=BioConservation(),
         n_jobs=6,
@@ -175,7 +177,7 @@ def multiprocessing_train_fold(folds, worker_function, func_args_list, train_fun
         if result is None:
             logging.error(f"Fold {fold_id} failed.")
         results_dict[fold_id] = result
-    print(results_dict)
+    # print(results_dict)
 
     results = [results_dict[i] for i in range(folds)]
     return results
@@ -187,66 +189,81 @@ def worker_function(func_args, return_queue, train_function):
         result = train_function(*func_args)
         return_queue.put((fold_id, result))
     except Exception as e:
-        logging.error(f"Error in fold {fold_id}: {str(e)}")
+        logging.error(f"Error in fold {fold_id}: {e}", exc_info=True)
         return_queue.put((fold_id, None))
 
 
 def train_fold(Model:nn.Module, adata, dataset_name, fold_id, DataParams, TrainingParams, device_id=6):
-    output_dir = f'result/{dataset_name}/integration/latentDim{TrainingParams['latent_dim']}_batchSize{TrainingParams['batch_size']}/'
+    from scgraph import scGraph
+
+    output_dir = f'result/{dataset_name}/integration/{Model.__name__}_latentDim{TrainingParams['latent_dim']}_batchSize{TrainingParams['batch_size']}/'
     os.makedirs(output_dir, exist_ok=True)
     os.makedirs(f'models/{dataset_name}/', exist_ok=True)
 
     device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    train_idx, test_idx = load_fold_indices(dataset_name, fold_num=fold_id)
-
-    # gex_adata_train = adata[train_idx, :].copy()
-    # gex_adata_test = adata[test_idx, :].copy()
-
-    gex_adata_train = adata.copy()
-    gex_adata_test = adata.copy()
-
-    print(f"Data shape: {gex_adata_train.X.shape}")
-
-    model = Model(latent_dim=TrainingParams['latent_dim'],
-                  device=device,
-                  use_norm=TrainingParams['normaliztion'],
-                  # use_zinb_decoder=True
+    print(f"Data shape: {adata.X.shape}")
+    print(f'use model: {Model.__name__}')
+    if Model.__name__ == 'DVAE_RBM':
+        model = Model(latent_dim=TrainingParams['latent_dim'],
+                      device=device,
+                      use_norm=TrainingParams['normaliztion'],
+                      beta_kl=TrainingParams['beta_kl'],
+                      # use_zinb_decoder=True
+                      )
+        model.set_adata(adata, batch_key=DataParams['batch_key'])
+    
+        model.fit(adata,
+                  epochs=TrainingParams['epochs'],
+                  lr=TrainingParams['lr'],
+                  early_stopping_patience=10,
+                  n_epochs_kl_warmup=50,
+                  batch_size=TrainingParams['batch_size'],
+                  # layer_key='counts'
                   )
-    model.set_adata(gex_adata_train, batch_key=DataParams['batch_key'])
+    elif Model.__name__ == 'VAE':
+        model = Model(latent_dim=TrainingParams['latent_dim'],
+                      device=device,
+                      use_norm=TrainingParams['normaliztion'],
+                      beta_kl=TrainingParams['beta_kl'],
+                      # use_zinb_decoder=True
+                      )
+        print('model constructed')
+        model.set_adata(adata, batch_key=DataParams['batch_key'])
+        print('set adata')
 
-    model.fit(gex_adata_train,
-              epochs=TrainingParams['epochs'],
-              lr=TrainingParams['lr'],
-              early_stopping_patience=10,
-              n_epochs_kl_warmup=50,
-              batch_size=TrainingParams['batch_size'],
-              # layer_key='counts'
-              )
+        model.fit(adata,
+                  epochs=TrainingParams['epochs'],
+                  lr=TrainingParams['lr'],
+                  early_stopping_patience=10,
+                  n_epochs_kl_warmup=50,
+                  batch_size=TrainingParams['batch_size'],
+                  # layer_key='counts'
+                  )
 
     torch.save(model.state_dict(), f'models/{dataset_name}/RBM_VAE_model{fold_id}_latentDim{TrainingParams['latent_dim']}_batchsize{TrainingParams['batch_size']}.pt')
 
     # Add latent representations to AnnData
-    gex_adata_test.obsm['reps'] = model.get_representation(
-        gex_adata_test,
+    adata.obsm['reps'] = model.get_representation(
+        adata,
         # layer_key='counts'
     )
-    latent_test = gex_adata_test.obsm['reps']
+    latent_test = adata.obsm['reps']
 
     # UMAP and clustering
-    sc.pp.neighbors(gex_adata_test, use_rep='reps')
-    sc.tl.leiden(gex_adata_test, random_state=42)
+    sc.pp.neighbors(adata, use_rep='reps')
+    sc.tl.leiden(adata, random_state=42)
 
-    sc.tl.umap(gex_adata_test, min_dist=0.2)
+    sc.tl.umap(adata, min_dist=0.2)
     colors_use = [DataParams['labels_key'], DataParams['batch_key'], 'leiden'] if DataParams['batch_key'] != "" else [DataParams['labels_key'], 'leiden']
-    sc.pl.umap(gex_adata_test,
+    sc.pl.umap(adata,
                color=colors_use,
                show=False,
                frameon=False,
                ncols=1, )
     plt.savefig(
-        f'{output_dir}{dataset_name}_{Model.__name__}_cell_latentDim{TrainingParams["latent_dim"]}_fold{fold_id}.pdf',
+        f'{output_dir}/{dataset_name}_{Model.__name__}_cell_latentDim{TrainingParams["latent_dim"]}_fold{fold_id}.pdf',
         dpi=1000, bbox_inches='tight')
 
     # sc.pl.spatial(gex_adata_test,
@@ -260,14 +277,32 @@ def train_fold(Model:nn.Module, adata, dataset_name, fold_id, DataParams, Traini
     #     f'{output_dir}{dataset_name}_{Model.__name__}_cell_Spatial_latentDim{TrainingParams["latent_dim"]}_fold{fold_id}.pdf',
     #     dpi=1000, bbox_inches='tight')
     # sc.tl.louvain(gex_adata_test, random_state=42)
+    # Initialize the graph analyzer
+    adata.write(f'{dataset_name}_RBM_fold{fold_id}.h5ad')
+    scgraph = scGraph(
+        adata_path=f'{dataset_name}_RBM_fold{fold_id}.h5ad',  # Path to AnnData object
+        batch_key=DataParams['batch_key'],  # Column name for batch information
+        label_key=DataParams['labels_key'],  # Column name for cell type labels
+        trim_rate=0.05,  # Trim rate for robust mean calculation
+        thres_batch=100,  # Minimum number of cells per batch
+        thres_celltype=10,  # Minimum number of cells per cell type
+        only_umap=False,  # Only evaluate 2D embeddings (mostly umaps)
+    )
+
+    # Run the analysis, return a pandas dataframe
+    results = scgraph.main()
+    results.to_csv(f'{output_dir}{dataset_name}_RBMVAE_scgraph_fold{fold_id}.csv')
+
+    print('scgraph', results)
 
     # Clustering metrics
     clustering_value = []
-    if DataParams['labels_key'] in gex_adata_test.obs:
-        leiden_ARI, leiden_AMI, leiden_NMI, leiden_HOM, leiden_FMI = compute_clusters_performance(gex_adata_test,
+    if DataParams['labels_key'] in adata.obs:
+        leiden_ARI, leiden_AMI, leiden_NMI, leiden_HOM, leiden_FMI = compute_clusters_performance(adata,
                                                                                                   DataParams[
                                                                                                       'labels_key'])
         clustering_value.extend([leiden_ARI, leiden_AMI, leiden_NMI, leiden_HOM, leiden_FMI])
+
 
         # louvain_ARI, louvain_AMI, louvain_NMI, louvain_HOM, louvain_FMI = compute_clusters_performance(gex_adata_test, DataParams['labels_key'], cluster_key='louvain')
 
@@ -278,6 +313,134 @@ def train_fold(Model:nn.Module, adata, dataset_name, fold_id, DataParams, Traini
     #     clustering_value.extend(scib_values)
 
     return clustering_value
+
+
+from sklearn.linear_model import LogisticRegression
+
+
+def train_logistic_regression_classifier(Model: nn.Module, adata, dataset_name, fold_id, DataParams, TrainingParams, device_id=6):
+    """
+    Loads a pre-trained model, freezes its parameters, extracts embeddings,
+    and then trains a Logistic Regression classifier to validate on the test set.
+
+    Args:
+        Model: The neural network model class.
+        adata: AnnData object containing gene expression data.
+        dataset_name: Name of the dataset.
+        fold_id: The cross-validation fold ID.
+        DataParams: Dictionary of data-related parameters.
+        TrainingParams: Dictionary of training-related parameters.
+        device_id: GPU device ID, defaults to 6.
+
+    Returns:
+        classification_metrics: A list of classification performance metrics.
+    """
+    import torch
+    import numpy as np
+    import os
+    from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+    from sklearn.preprocessing import LabelEncoder
+    # Assuming these functions are defined elsewhere in your project
+    # from model.visualization_func import plot_confusion_matrix
+    # from your_utils import load_fold_indices
+
+    # Setup output directory
+    output_dir = f'result/{dataset_name}/classification_metrics'
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Set device
+    device = torch.device(f"cuda:{device_id}" if torch.cuda.is_available() else "cpu")
+    print(f"Using device for embedding extraction: {device}")
+
+    # Load cross-validation fold indices
+    # This function needs to be available in your environment
+    train_idx, test_idx = load_fold_indices(dataset_name, fold_num=fold_id)
+
+
+
+
+    # Split data into training and testing sets
+    gex_adata_train = adata[train_idx, :].copy()
+    gex_adata_test = adata[test_idx, :].copy()
+
+    print(f"Training data shape: {gex_adata_train.X.shape}")
+    print(f"Testing data shape: {gex_adata_test.X.shape}")
+
+    # Initialize and load the pre-trained model
+    model = Model(latent_dim=TrainingParams['latent_dim'],
+                  device=device,
+                  # Add other necessary parameters for your model
+                 )
+    model.set_adata(gex_adata_train, batch_key=DataParams['batch_key'])
+
+    # Load saved model weights
+    model_path = f'models/{dataset_name}/{dataset_name}.pth'
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    model.to(device)
+
+    # Freeze model parameters
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Extract embeddings for the training and test sets
+    with torch.no_grad():
+        gex_adata_train.obsm['reps'] = model.get_representation(gex_adata_train)
+        gex_adata_test.obsm['reps'] = model.get_representation(gex_adata_test)
+
+    # Get embeddings and labels
+    X_train = gex_adata_train.obsm['reps']
+    X_test = gex_adata_test.obsm['reps']
+
+    # Ensure labels key exists
+    if DataParams['labels_key'] not in gex_adata_train.obs:
+        raise ValueError(f"Label key '{DataParams['labels_key']}' not found in adata.obs")
+
+    # Encode labels
+    le = LabelEncoder()
+    y_train = le.fit_transform(gex_adata_train.obs[DataParams['labels_key']])
+    y_test = le.transform(gex_adata_test.obs[DataParams['labels_key']])
+
+    # --- Start of Logistic Regression Specific Code ---
+    # Initialize Logistic Regression classifier
+    # Note: Logistic Regression runs on the CPU, so GPU parameters are removed.
+    lr_classifier = LogisticRegression(
+        random_state=0,
+        max_iter=100,  # Increased max_iter for convergence on complex datasets
+        n_jobs=-1       # Use all available CPU cores
+    )
+
+    # Train the Logistic Regression classifier
+    print("Training Logistic Regression classifier...")
+    lr_classifier.fit(X_train, y_train)
+
+    # Predict on the test set
+    print("Evaluating on the test set...")
+    y_pred = lr_classifier.predict(X_test)
+    # --- End of Logistic Regression Specific Code ---
+
+    # Calculate classification metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    precision, recall, f1, _ = precision_recall_fscore_support(y_test, y_pred, average='weighted')
+
+    classification_metrics = [accuracy, precision, recall, f1]
+
+    # Save classification results (optional, uncomment to use)
+    # results_file = f'{output_dir}/{dataset_name}_LogisticRegression_classification_fold{fold_id}.txt'
+    # with open(results_file, 'w') as f:
+    #     f.write(f"Accuracy: {accuracy:.4f}\n")
+    #     f.write(f"Precision: {precision:.4f}\n")
+    #     f.write(f"Recall: {recall:.4f}\n")
+    #     f.write(f"F1 Score: {f1:.4f}\n")
+    # print(f"Classification metrics saved to {results_file}")
+
+    # Get original label names
+    labels = le.classes_
+
+    # Plot confusion matrix (assuming plot_confusion_matrix is defined)
+    # plot_confusion_matrix(y_test, y_pred, labels, dataset_name, fold_id, output_dir, Model.__name__)
+
+    return classification_metrics
 
 
 def train_xgboost_classifier(Model: nn.Module, adata, dataset_name, fold_id, DataParams, TrainingParams, device_id=6):
@@ -328,13 +491,16 @@ def train_xgboost_classifier(Model: nn.Module, adata, dataset_name, fold_id, Dat
     # 初始化并加载训练好的模型
     model = Model(latent_dim=TrainingParams['latent_dim'],
                   device=device,
-                  use_norm=TrainingParams['normaliztion'],
+                  # normalization_method=TrainingParams['normaliztion']
+                  # use_norm=TrainingParams['normaliztion'],
                   # use_zinb_decoder=True
                   )
     model.set_adata(gex_adata_train, batch_key=DataParams['batch_key'])
 
     # 加载保存的模型权重
-    model_path = f'models/{dataset_name}/RBM_VAE_model{fold_id}_latentDim{TrainingParams['latent_dim']}_batchsize{TrainingParams['batch_size']}.pt'
+    # model_path = f'models/{dataset_name}/RBM_VAE_model{fold_id}_latentDim{TrainingParams['latent_dim']}_batchsize{TrainingParams['batch_size']}.pt'
+    model_path = f'models/{dataset_name}/{dataset_name}.pth'
+
     model.load_state_dict(torch.load(model_path))
     model.eval()
     model.to(device)
@@ -365,7 +531,7 @@ def train_xgboost_classifier(Model: nn.Module, adata, dataset_name, fold_id, Dat
         n_estimators=100,
         max_depth=6,
         learning_rate=0.1,
-        random_state=42,
+        random_state=0,
         tree_method='hist',  # 使用基于直方图的算法，支持GPU
         device='cuda',  # 明确指定使用GPU
         predictor='cuda',  # 使用GPU预测器
@@ -665,7 +831,7 @@ def analyze_dpt(Model: nn.Module, adata, dataset_name, fold_id, DataParams, Trai
     kendall_score= compute_kendall_trajectory_conservation(unintegrated_adata, adata)
     print(f"Trajectory conservation score: {kendall_score:.3f}")
 
-    return kendall_score
+    return trajectory_conservation_score
 
 
 def broadcast_shape(*shapes, **kwargs):
