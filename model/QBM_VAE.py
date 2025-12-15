@@ -11,6 +11,11 @@ from typing import Callable, Literal
 from .utils import LossFunction
 import logging
 
+
+def gram_matrix(x, sigma=1):
+    pairwise_distances = x.unsqueeze(1) - x
+    return torch.exp(-pairwise_distances.norm(2, dim=2) / (2 * sigma * sigma))
+
 class scDataset(Dataset):
     def __init__(self, anndata_info, batch_indices=None):
         """
@@ -306,12 +311,12 @@ class RBM(nn.Module):
         z = z.float()
         h_term = torch.sum(z * self.h, dim=-1)
         w_term = torch.sum((z @ self.W) * z, dim=-1)  # 注意对称性
-        return h_term + w_term
+        return -(h_term + w_term)
 
-    def gibbs_sampling(self, num_samples, steps=1):
+    def gibbs_sampling(self, num_samples, steps=10):
         z = torch.randint(0, 2, (num_samples, self.latent_dim), dtype=torch.float).to(self.h.device)
         for _ in range(steps):
-            probs = torch.sigmoid(self.h + z @ self.W)
+            probs = torch.sigmoid((self.h + z @ self.W))
             z = (torch.rand_like(z) < probs).float()
         return z
 
@@ -328,8 +333,8 @@ class RBM(nn.Module):
         negative_w_grad = torch.einsum('bi,bj->ij', z_negative, z_negative) / z_negative.size(0)
 
         # 总梯度
-        h_grad = positive_h_grad - negative_h_grad
-        w_grad = positive_w_grad - negative_w_grad
+        h_grad = -(positive_h_grad - negative_h_grad)
+        w_grad = -(positive_w_grad - negative_w_grad)
         # 对称化W的梯度（因为RBM假设W对称）
         w_grad = (w_grad + w_grad.T) / 2
         return {'h': h_grad, 'W': w_grad}
@@ -368,7 +373,7 @@ class QBM_VAE(nn.Module):
         self.batch_encoder=None
 
         # Store AnnData and batch information
-        self.adata = None
+        #self.adata = None
         self.batch_key = None
         self.batch_indices = None
 
@@ -378,7 +383,7 @@ class QBM_VAE(nn.Module):
     def set_adata(self,
                   adata: anndata.AnnData,
                   batch_key='batch'):
-        self.adata = adata.copy()
+        #self.adata = adata.copy()
         self.batch_key = batch_key
         self.input_dim = adata.X.shape[1]
 
@@ -547,16 +552,40 @@ class QBM_VAE(nn.Module):
 
         self.eval()
         latent_reps = []
+        latent_energy = []
         with torch.no_grad():
             for x, batch_idx in dataloader:
                 x = x.to(self.device)
                 batch_idx = batch_idx.to(self.device)
                 _, _, _, z, zeta = self(x, batch_idx)
                 latent_reps.append(zeta.cpu().numpy())
+                latent_energy.append(self.rbm.energy(zeta).cpu().numpy())
 
         reps = np.concatenate(latent_reps, axis=0)
+        latent_energy = np.concatenate(latent_energy, axis=0)
         print(f"Latent representation shape: {reps.shape}")
-        return reps
+        return reps, latent_energy
+
+
+
+    def compute_hsic(self, x, batch_indices, sigma=1):
+        if self.use_batch:
+            if self.batch_representation == 'embedding':
+                y = self.batch_encoder(batch_indices)
+            elif self.batch_representation == 'one-hot':
+                y = self._get_batch_one_hot(batch_indices)
+
+        m = x.shape[0]
+        y = y.float()
+        K = gram_matrix(x, sigma=sigma)
+        L = gram_matrix(y, sigma=sigma)
+        H = torch.eye(m) - 1.0 / m * torch.ones((m, m))
+        device = x.device
+
+        H = H.float().to(device)
+        HSIC = torch.trace(torch.mm(L, torch.mm(H, torch.mm(K, H)))) / ((m - 1) ** 2)
+        return HSIC
+
 
     def fit(self,
             adata,
@@ -609,7 +638,7 @@ class QBM_VAE(nn.Module):
             torch.tensor(adata_train_array, dtype=torch.float32),
             train_batch_indices
         )
-        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
 
 
         optimizer = torch.optim.Adam(
@@ -636,12 +665,15 @@ class QBM_VAE(nn.Module):
             for x, batch_idx in train_dataloader:
                 x = x.to(self.device)
                 batch_idx = batch_idx.to(self.device)
+
                 optimizer.zero_grad()
                 rbm_optimizer.zero_grad()
 
                 elbo, recon_loss, kl_loss, z, zeta = self(x, batch_idx)
+                #hsic_score = self.compute_hsic(x, batch_idx)
                 loss = -elbo
                 loss.backward()
+                optimizer.step()
 
                 # 手动计算RBM的梯度
                 # rbm_grads = self.rbm.compute_gradients(z.detach())  # z.detach()避免重复求导
@@ -649,7 +681,6 @@ class QBM_VAE(nn.Module):
                 #     self.rbm.h.grad = rbm_grads['h']
                 #     self.rbm.W.grad = rbm_grads['W']
 
-                optimizer.step()
                 rbm_optimizer.step()
 
                 total_elbo += elbo.item()
@@ -704,4 +735,309 @@ class QBM_VAE(nn.Module):
         epoch_pbar.close()
 
 
+class VAEEncoder(nn.Module):
+    def __init__(self,
+                 input_dim,
+                 hidden_dims,  # hidden_dims 现在是一个列表
+                 latent_dim,
+                 normalization="batchnorm"):
+        super(VAEEncoder, self).__init__()
 
+        # 确保 hidden_dims 是一个列表
+        if not isinstance(hidden_dims, list):
+            raise ValueError("hidden_dims must be a list of integers.")
+
+        self.hidden_layers = nn.ModuleList()
+        self.norm_layers = nn.ModuleList()
+        self.normalization_type = normalization
+
+        # ---- 动态构建隐藏层 ----
+
+        # 第一个隐藏层
+        in_dim = input_dim
+        out_dim = hidden_dims[0]
+        self.hidden_layers.append(nn.Linear(in_dim, out_dim))
+
+        # 为第一层添加归一化
+        if self.normalization_type == "batchnorm":
+            self.norm_layers.append(nn.BatchNorm1d(out_dim))
+        elif self.normalization_type == "layernorm":
+            self.norm_layers.append(nn.LayerNorm(out_dim))
+
+        # 后续的隐藏层
+        for i in range(len(hidden_dims) - 1):
+            in_dim = hidden_dims[i]
+            out_dim = hidden_dims[i + 1]
+            self.hidden_layers.append(nn.Linear(in_dim, out_dim))
+
+            # 为后续层添加归一化
+            if self.normalization_type == "batchnorm":
+                self.norm_layers.append(nn.BatchNorm1d(out_dim))
+            elif self.normalization_type == "layernorm":
+                self.norm_layers.append(nn.LayerNorm(out_dim))
+
+        # ---- 输出层 ----
+        # 输出层的输入维度是最后一个隐藏层的维度
+        last_hidden_dim = hidden_dims[-1]
+        self.fc_mu = nn.Linear(last_hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(last_hidden_dim, latent_dim)
+
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x):
+        h = x
+        # 依次通过所有隐藏层
+        for i, layer in enumerate(self.hidden_layers):
+            h = layer(h)
+            if self.normalization_type in ["batchnorm", "layernorm"]:
+                h = self.norm_layers[i](h)
+            h = F.relu(h)
+            h = self.dropout(h)
+
+        # 计算 mu 和 logvar
+        mu = self.fc_mu(h)
+        logvar = self.fc_logvar(h)
+
+        return mu, logvar
+
+
+class VAE(nn.Module):
+    def __init__(self,
+                 hidden_dim=[512],
+                 latent_dim=256,
+                 beta_kl=0.001,
+                 use_norm="batch",  # 修改位置
+                 device=torch.device('cpu')):
+        super(VAE, self).__init__()
+        self.hidden_dim = hidden_dim
+        self.latent_dim = latent_dim
+        self.beta_kl = beta_kl
+        self.normalization_method = use_norm  # 修改位置
+        self.device = device
+
+        self.input_dim = None
+        self.n_batches = None
+        self.encoder = None
+        self.decoder = None
+
+        self.adata = None
+        self.batch_key = None
+        self.batch_indices = None
+
+        self.to(device)
+
+    def set_adata(self,
+                  adata: anndata.AnnData,
+                  batch_key='batch'):
+        """
+        Store AnnData object, set input_dim, and initialize model components.
+        """
+        self.adata = adata.copy()
+        self.batch_key = batch_key
+
+        self.input_dim = adata.X.shape[1]
+
+        if batch_key not in adata.obs:
+            raise ValueError(f"Batch key '{batch_key}' not found in adata.obs")
+
+        batch_categories = adata.obs[batch_key].astype('category')
+        self.batch_indices = torch.tensor(batch_categories.cat.codes.values, dtype=torch.long)
+        self.n_batches = len(batch_categories.cat.categories)
+
+        # 修改位置：传入 normalization_method 给 VAEEncoder 和 Decoder
+        self.encoder = VAEEncoder(
+            self.input_dim,
+            self.hidden_dim,
+            self.latent_dim,
+            normalization=self.normalization_method  # 修改位置
+        ).to(self.device)
+
+        self.decoder = Decoder(
+            self.latent_dim + self.n_batches,
+            self.hidden_dim,
+            self.input_dim,
+            normalization=self.normalization_method  # 修改位置
+        ).to(self.device)
+
+        print(f"Set AnnData with input_dim={self.input_dim}, {self.n_batches} batches")
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        z = mu + eps * std
+        return z
+
+    def kl_divergence(self, mu, logvar):
+        kl = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp(), dim=-1)
+        return kl.mean()
+
+    def _get_batch_one_hot(self, indices):
+        return F.one_hot(indices, num_classes=self.n_batches).float().to(self.device)
+
+    def forward(self, x, batch_indices):
+        batch_one_hot = self._get_batch_one_hot(batch_indices)
+
+        mu, logvar = self.encoder(x)
+        z = self.reparameterize(mu, logvar)
+
+        decoder_input = torch.cat([z, batch_one_hot], dim=-1)
+        x_recon = self.decoder(decoder_input)
+
+        recon_loss = F.mse_loss(x_recon, x, reduction='sum') / x.size(0)
+        kl_loss = self.kl_divergence(mu, logvar)
+        elbo = -recon_loss - self.beta_kl * kl_loss
+
+        return elbo, recon_loss, kl_loss, z
+
+    def fit(self,
+            adata=None,
+            val_percentage=0.1,
+            batch_size=128,
+            epochs=100,
+            lr=1e-3,
+            early_stopping=True,
+            early_stopping_patience=10,
+            n_epochs_kl_warmup=None,
+            verbose=0
+            ):
+        if adata is None and self.adata is None:
+            raise ValueError("No AnnData object provided or set")
+        adata = adata if adata is not None else self.adata
+
+        adata_array = adata.X.toarray() if hasattr(adata.X, 'toarray') else adata.X
+        batch_indices = torch.tensor(adata.obs[self.batch_key].astype('category').cat.codes.values, dtype=torch.long)
+
+        # 初始化存储中间结果的变量
+        intermediate_results = {
+            'rbm_params': [],
+            'all_train_elbo': [],
+            'all_val_elbo': []
+        } if verbose == 1 else None
+
+        if early_stopping:
+            train_indices, val_indices = train_test_split(
+                np.arange(adata.shape[0]), test_size=val_percentage, random_state=0
+            )
+
+            adata_train_array = adata_array[train_indices]
+            adata_val_array = adata_array[val_indices]
+            train_batch_indices = batch_indices[train_indices]
+            val_batch_indices = batch_indices[val_indices]
+
+            val_dataset = scDataset(adata_val_array, val_batch_indices)
+            val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+        else:
+            adata_train_array = adata_array
+            train_batch_indices = batch_indices
+
+        train_dataset = scDataset(adata_train_array, train_batch_indices)
+        train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
+
+        optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+
+        best_val_elbo = float('-inf')
+        patience_counter = 0
+        epoch_pbar = tqdm(range(1, epochs + 1), desc="Training Progress", total=epochs)
+        best_state_dict = None
+
+        kl_warmup_epochs = n_epochs_kl_warmup or epochs
+
+        train_step = 1
+        val_step = 1
+
+        for epoch in epoch_pbar:
+            self.train()
+            total_elbo, total_recon, total_kl = 0, 0, 0
+            for x, batch_idx in train_dataloader:
+                x = x.to(self.device)
+                batch_idx = batch_idx.to(self.device)
+                optimizer.zero_grad()
+
+                elbo, recon_loss, kl_loss, z = self(x, batch_idx)
+                loss = -elbo
+                loss.backward()
+                optimizer.step()
+
+                total_elbo += elbo.item()
+                total_recon += recon_loss.item()
+                total_kl += kl_loss.item()
+
+            avg_elbo = total_elbo / len(train_dataloader)
+            avg_recon = total_recon / len(train_dataloader)
+            avg_kl = total_kl / len(train_dataloader)
+            if verbose == 1:
+                intermediate_results['all_train_elbo'].append(avg_elbo)
+
+                # with open(os.path.join(output_dir, f"epoch_log_fold{fold_id}.txt"), "a") as log_file:
+                #     log_file.write(
+                #         f"Epoch {epoch}: ELBO={avg_elbo:.4f}, Recon={avg_recon:.4f}, KL={avg_kl:.4f}, Time={epoch_duration:.2f}s\n")
+
+            epoch_pbar.set_postfix({
+                'KL_weight': f'{self.beta_kl}',
+                'ELBO': f'{avg_elbo:.4f}',
+                'Recon': f'{avg_recon:.4f}',
+                'KL': f'{avg_kl:.4f}'
+            })
+
+            if early_stopping:
+                self.eval()
+                val_total_elbo, val_total_recon, val_total_kl = 0, 0, 0
+                for x, batch_idx in val_dataloader:
+                    x = x.to(self.device)
+                    batch_idx = batch_idx.to(self.device)
+                    with torch.no_grad():
+                        elbo, recon_loss, kl_loss, z = self(x, batch_idx)
+
+                    val_total_elbo += elbo.item()
+                    val_total_recon += recon_loss.item()
+                    val_total_kl += kl_loss.item()
+
+                avg_val_elbo = val_total_elbo / len(val_dataloader)
+                if verbose == 1:
+                    intermediate_results['all_val_elbo'].append(avg_val_elbo)
+
+                if avg_val_elbo > best_val_elbo:
+                    best_val_elbo = val_total_elbo / len(val_dataloader)
+                    patience_counter = 0
+                    best_state_dict = self.state_dict()
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= early_stopping_patience:
+                    tqdm.write(f"Early stopping triggered after {epoch} epochs")
+                    if best_state_dict is not None:
+                        self.load_state_dict(best_state_dict)
+                    epoch_pbar.close()
+                    break
+        epoch_pbar.close()
+
+        if verbose == 1:
+            return intermediate_results
+        else:
+            return None
+
+    def get_representation(self,
+                           adata=None,
+                           batch_size=128):
+        if adata is None and self.adata is None:
+            raise ValueError("No AnnData object provided or set")
+        adata = adata if adata is not None else self.adata
+
+        adata_array = adata.X.toarray() if hasattr(adata.X, 'toarray') else adata.X
+        batch_indices = torch.tensor(adata.obs[self.batch_key].astype('category').cat.codes.values, dtype=torch.long)
+
+        dataset = scDataset(adata_array, batch_indices)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+
+        self.eval()
+        latent_reps = []
+        with torch.no_grad():
+            for x, batch_idx in dataloader:
+                x = x.to(self.device)
+                batch_idx = batch_idx.to(self.device)
+                _, _, _, z = self(x, batch_idx)
+                latent_reps.append(z.cpu().numpy())
+
+        reps = np.concatenate(latent_reps, axis=0)
+        print(f"Latent representation shape: {reps.shape}")
+        return reps
