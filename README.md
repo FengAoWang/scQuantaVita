@@ -9,8 +9,7 @@
 
 **Unveiling the Energy Landscape of Cell Fate with Statistical Physics & Quantum Computing**
 
-[Introduction](#introduction) • [Methodology](#methodology) • [Installation](#installation) • [Quick Start](#quick-start) • [Citation](#citation)
-
+[Introduction](#-introduction) • [Methodology](#-methodology) • [Installation](#-installation) • [Quick Start](#-quick-start) • [Tutorials](#-tutorials) • [Biological Application](#-biological-application-csp-analysis)
 </div>
 
 ---
